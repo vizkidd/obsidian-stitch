@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Obsidian Vault Stitcher & PDF Exporter (WASM)</title>
+
+    <!-- Google Fonts: Inter & JetBrains Mono -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+    <!-- UI & Drag-and-Drop -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+
+    <!-- Vis Network Graph -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/dist/vis-network.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js"></script>
+
+    <!-- Canvas & PDF Engine -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <!-- Pyodide WASM Runtime -->
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js"></script>
+
+    <style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0; padding: 20px; background: #18181a; color: #e0e0e0;
+            display: flex; gap: 20px; height: 100vh; box-sizing: border-box;
+        }
+        .panel {
+            background: #242427; border-radius: 10px; padding: 20px;
+            display: flex; flex-direction: column; border: 1px solid #333338;
+        }
+        #left-panel { flex: 1; min-width: 320px; max-width: 420px; }
+        #right-panel { flex: 2; display: flex; flex-direction: column; }
+        .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .theme-select-container { display: flex; align-items: center; gap: 8px; font-size: 0.9em; color: #aaa; }
+        select.theme-dropdown {
+            background: #18181a; color: #fff; border: 1px solid #44444c; padding: 6px 12px;
+            border-radius: 6px; font-size: 0.85em; cursor: pointer; outline: none;
+        }
+        #mynetwork {
+            width: 100%; flex-grow: 1; min-height: 480px; border-radius: 8px;
+            background: #1e1e20; border: 1px solid #333338; transition: background 0.3s ease;
+        }
+        .file-list { list-style: none; padding: 0; margin: 15px 0; overflow-y: auto; flex-grow: 1; }
+        .file-list li {
+            background: #2e2e33; margin-bottom: 8px; padding: 10px 14px; border-radius: 6px;
+            cursor: grab; font-size: 0.9em; display: flex; align-items: center; border-left: 4px solid #7852ee;
+            user-select: none;
+        }
+        .file-list li:active { cursor: grabbing; }
+        .btn {
+            background: #7852ee; color: white; border: none; padding: 12px 20px; border-radius: 6px;
+            cursor: pointer; font-size: 15px; font-weight: 600; width: 100%; transition: background 0.2s;
+        }
+        .btn:hover { background: #633ec7; }
+        .subtext { font-size: 0.82em; color: #888; margin-top: -5px; margin-bottom: 15px; }
+        #status-box { font-size: 0.85em; color: #7f6df2; margin-top: 10px; text-align: center; }
+        .upload-group { display: flex; flex-direction: column; gap: 8px; margin-bottom: 15px; }
+        .upload-label { font-size: 0.85em; color: #bbb; }
+        input[type="file"] { font-size: 0.85em; color: #aaa; }
+        h2 { font-size: 1.1em; margin: 0; color: #fff; }
+
+        /* Offscreen render container */
+        #pdf-render-stage {
+            position: absolute;
+            left: -9999px;
+            top: 0;
+            width: 794px;
+            z-index: 1;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="panel" id="left-panel">
+        <h2>1. Import Vault Content</h2>
+        <div class="upload-group" style="margin-top: 10px;">
+            <span class="upload-label">Import Folder:</span>
+            <input type="file" id="folderInput" multiple webkitdirectory directory disabled>
+        </div>
+        <div class="upload-group">
+            <span class="upload-label">Import Individual Files:</span>
+            <input type="file" id="fileInput" multiple accept=".md,.png,.jpg,.jpeg,.gif,.svg,.webp" disabled>
+        </div>
+        <p class="subtext">Select an Obsidian vault folder or individual Markdown & image files.</p>
+
+        <h2>2. Order Document Pages</h2>
+        <p class="subtext">Drag items to arrange PDF layout sequence.</p>
+        <ul id="sortable-list" class="file-list"></ul>
+
+        <button class="btn" id="generateBtn" style="display: none;">Generate PDF Document</button>
+        <div id="status-box">Loading Python WASM Runtime...</div>
+    </div>
+
+    <div class="panel" id="right-panel">
+        <div class="header-row">
+            <h2>Graph View Overview</h2>
+            <div class="theme-select-container">
+                <label for="themeSelect">Theme Mode:</label>
+                <select id="themeSelect" class="theme-dropdown">
+                    <option value="dark" selected>Obsidian Dark</option>
+                    <option value="light">Obsidian Light</option>
+                </select>
+            </div>
+        </div>
+        <div id="mynetwork"></div>
+    </div>
+
+    <div id="pdf-render-stage"></div>
+
+    <script>
+        let pyodide = null;
+        let network = null;
+        let currentGraphData = null;
+        let vaultFiles = {};
+        let vaultAssets = {};
+
+        const OBSIDIAN_SCHEMES = {
+            dark: {
+                bg: '#1e1e20', text: '#dcddde', title: '#ffffff', accent: '#7f6df2',
+                border: '#38383e', th_bg: '#2a2a2e', tr_even_bg: '#252528', code_bg: '#252529',
+                quote_bg: '#25252a', nodeUnresolved: '#6c6c70', edgeColor: '#a78bfa', borderHighlight: '#c4b5fd'
+            },
+            light: {
+                bg: '#ffffff', text: '#222222', title: '#111111', accent: '#6c31e8',
+                border: '#cccccc', th_bg: '#f0f0f5', tr_even_bg: '#fafafa', code_bg: '#f6f8fa',
+                quote_bg: '#fcfbfe', nodeUnresolved: '#999999', edgeColor: '#6c31e8', borderHighlight: '#7852ee'
+            }
+        };
+
+        const sortable = new Sortable(document.getElementById('sortable-list'), { animation: 150 });
+
+        async function initWasm() {
+            pyodide = await loadPyodide();
+            await pyodide.loadPackage("micropip");
+            const micropip = pyodide.pyimport("micropip");
+            await micropip.install("markdown");
+            micropip.destroy();
+
+            pyodide.runPython(`
+import re
+import json
+import markdown
+
+WIKILINK_RE = re.compile(r'(?<!\\!)\\[\\[(.*?)\\]\\]')
+EMBED_RE = re.compile(r'\\!\\[\\[(.*?)\\]\\]')
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')
+
+def norm_title(title):
+    if not title: return ""
+    t = title.strip()
+    if t.lower().endswith('.md'):
+        t = t[:-3]
+    return t.strip().lower()
+
+def is_valid_node_title(title):
+    if not title: return False
+    t = title.strip()
+    if not t or t.lstrip('-+').isdigit(): return False
+    if any(t.lower().endswith(ext) for ext in ('.pdf', '.doc', '.docx')): return False
+    return True
+
+def process_vault_graph(files_json):
+    files = json.loads(files_json)
+    md_files = [f for f in files.keys() if f.lower().endswith('.md')]
+    all_titles = {norm_title(f): f for f in md_files}
+
+    node_map = {}
+    nodes = []
+    edges = []
+
+    def get_or_create_node(raw_title):
+        clean_t = norm_title(raw_title)
+        if clean_t not in node_map:
+            node_id = len(node_map) + 1
+            node_map[clean_t] = node_id
+            is_missing = clean_t not in all_titles
+            nodes.append({"id": node_id, "label": raw_title.strip(), "is_missing": is_missing})
+        return node_map[clean_t]
+
+    for fname in md_files:
+        title = fname[:-3] if fname.lower().endswith('.md') else fname
+        source_id = get_or_create_node(title)
+        content = files[fname]
+        links = WIKILINK_RE.findall(content)
+
+        for link in links:
+            target = link.split('|')[0].strip()
+            if '#' in target: target = target.split('#')[0].strip()
+            if '^' in target: target = target.split('^')[0].strip()
+
+            if not is_valid_node_title(target): continue
+            target_id = get_or_create_node(target)
+            edges.append({"from": source_id, "to": target_id})
+
+    return json.dumps({"graph": {"nodes": nodes, "edges": edges}, "files": md_files})
+
+def analyze_table_columns(md_content):
+    max_cols = 0
+    for line in md_content.splitlines():
+        if '|' in line:
+            cols = [c.strip() for c in line.split('|') if c.strip()]
+            if len(cols) > max_cols: max_cols = len(cols)
+    return max_cols
+
+def parse_frontmatter(content):
+    fm_match = re.match(r'^---\\s*\\n(.*?)\\n---\\s*\\n', content, re.DOTALL)
+    tags_html = ""
+    if fm_match:
+        fm_text = fm_match.group(1)
+        content = content[fm_match.end():]
+        tags = []
+        tag_match = re.search(r'tags:\\s*([^\\n]+)', fm_text)
+        if tag_match:
+            raw_tags = tag_match.group(1)
+            tags = [t.strip(' -[],"') for t in re.split(r'[, ]+', raw_tags) if t.strip(' -[],"')]
+        else:
+            tag_block = re.search(r'tags:\\s*\\n((?:\\s*-[^\\n]+\\n?)+)', fm_text)
+            if tag_block:
+                tags = [t.strip(' -[],"') for t in tag_block.group(1).splitlines() if t.strip(' -[],"')]
+        
+        if tags:
+            pills = "".join([f'<span class="obsidian-tag">#{t}</span>' for t in tags if t])
+            if pills:
+                tags_html = f'<div class="tags-container">{pills}</div>'
+                
+    return content, tags_html
+
+def linkify_html(html):
+    tag_or_url_pattern = re.compile(r'(<a\\b[^>]*>.*?</a>|<[^>]+>)|(https?://[^\\s<>"\\)]+)', re.IGNORECASE | re.DOTALL)
+    
+    def replacer(match):
+        if match.group(1):
+            return match.group(1)
+        url = match.group(2)
+        trailing = ""
+        while url and url[-1] in '.,;:!':
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        return f'<a href="{url}" target="_blank" class="external-link">{url}</a>{trailing}'
+
+    return tag_or_url_pattern.sub(replacer, html)
+
+def render_note_to_html(filename, content, files_json, assets_json, title_to_id_json):
+    files_map = json.loads(files_json)
+    assets_map = json.loads(assets_json)
+    raw_title_to_id = json.loads(title_to_id_json)
+    
+    title_to_id = {norm_title(k): v for k, v in raw_title_to_id.items()}
+    processed_embeds = set()
+
+    content, tags_html = parse_frontmatter(content)
+
+    def embed_sub(match):
+        try:
+            raw = match.group(1).strip()
+        except IndexError:
+            return match.group(0)
+
+        parts = raw.split('|')
+        target = parts[0].strip()
+        clean_target = target.split('#')[0].strip()
+
+        if clean_target.lower().endswith(IMAGE_EXTENSIONS):
+            if clean_target in assets_map:
+                return f'<img src="{assets_map[clean_target]}" alt="{clean_target}" style="max-width:100%; height:auto; display:block; margin:12px auto;"/>'
+            return f'> *[Image Asset Missing: {clean_target}]*'
+
+        md_target = clean_target if clean_target.lower().endswith('.md') else f"{clean_target}.md"
+        if md_target in files_map and md_target not in processed_embeds:
+            processed_embeds.add(md_target)
+            return files_map[md_target]
+
+        return f'> *[Missing Transclusion: {clean_target}]*'
+
+    content = EMBED_RE.sub(embed_sub, content)
+
+    def wikilink_sub(match):
+        try:
+            raw = match.group(1).strip()
+        except IndexError:
+            return match.group(0)
+
+        parts = raw.split('|')
+        target_raw = parts[0].strip()
+        alias = parts[1].strip() if len(parts) > 1 else target_raw
+        clean_target = target_raw.split('#')[0].split('^')[0].strip()
+        norm_key = norm_title(clean_target)
+
+        if norm_key in title_to_id:
+            return f'<a href="#{title_to_id[norm_key]}" class="internal-link">{alias}</a>'
+        return f'<span class="unresolved-link">{alias}</span>'
+
+    content = WIKILINK_RE.sub(wikilink_sub, content)
+
+    html = markdown.markdown(content, extensions=['tables', 'fenced_code', 'sane_lists'])
+    html = linkify_html(html)
+    cols = analyze_table_columns(content)
+
+    if tags_html:
+        html = tags_html + html
+
+    return json.dumps({"html": html, "cols": cols})
+            `);
+
+            document.getElementById('status-box').textContent = "WASM Ready";
+            document.getElementById('folderInput').disabled = false;
+            document.getElementById('fileInput').disabled = false;
+        }
+
+        initWasm();
+
+        function renderGraph(schemeKey) {
+            if (!currentGraphData) return;
+            const scheme = OBSIDIAN_SCHEMES[schemeKey];
+            const container = document.getElementById('mynetwork');
+            container.style.backgroundColor = scheme.bg;
+
+            const updatedNodes = currentGraphData.nodes.map(n => ({
+                ...n,
+                color: { background: n.is_missing ? scheme.nodeUnresolved : scheme.accent, border: scheme.borderHighlight },
+                font: { color: scheme.text, size: 13, face: 'Inter, -apple-system, sans-serif' }
+            }));
+
+            if (network !== null) network.destroy();
+
+            network = new vis.Network(container, {
+                nodes: new vis.DataSet(updatedNodes),
+                edges: new vis.DataSet(currentGraphData.edges)
+            }, {
+                nodes: { shape: 'dot', size: 16, borderWidth: 1.5 },
+                edges: { 
+                    color: { color: scheme.edgeColor, highlight: scheme.borderHighlight, hover: scheme.borderHighlight }, 
+                    width: 2.5,
+                    arrows: { to: { enabled: true, scaleFactor: 0.8 } },
+                    smooth: { type: 'continuous' } 
+                },
+                physics: { solver: 'forceAtlas2Based', stabilization: { iterations: 150 } }
+            });
+
+            network.once('stabilizationIterationsDone', () => { 
+                network.setOptions({ physics: false }); 
+                network.fit(); 
+            });
+        }
+
+        document.getElementById('themeSelect').addEventListener('change', (e) => renderGraph(e.target.value));
+
+        async function handleFileImport(files) {
+            vaultFiles = {};
+            vaultAssets = {};
+
+            for (let f of files) {
+                if (f.name.startsWith('.')) continue;
+                
+                const ext = f.name.substring(f.name.lastIndexOf('.')).toLowerCase();
+                
+                if (ext === '.md') {
+                    vaultFiles[f.name] = await f.text();
+                } else if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'].includes(ext)) {
+                    vaultAssets[f.name] = await new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onload = (e) => resolve(e.target.result);
+                        reader.readAsDataURL(f);
+                    });
+                }
+            }
+
+            const pyFunc = pyodide.globals.get('process_vault_graph');
+            const pyResult = pyFunc(JSON.stringify(vaultFiles));
+            pyFunc.destroy();
+
+            const data = JSON.parse(pyResult);
+
+            const list = document.getElementById('sortable-list');
+            list.innerHTML = '';
+            data.files.forEach(file => {
+                const li = document.createElement('li');
+                li.textContent = file;
+                li.dataset.filename = file;
+                list.appendChild(li);
+            });
+
+            document.getElementById('generateBtn').style.display = 'block';
+            currentGraphData = data.graph;
+            renderGraph(document.getElementById('themeSelect').value);
+        }
+
+        document.getElementById('folderInput').addEventListener('change', (e) => handleFileImport(e.target.files));
+        document.getElementById('fileInput').addEventListener('change', (e) => handleFileImport(e.target.files));
+
+        document.getElementById('generateBtn').addEventListener('click', async () => {
+            const btn = document.getElementById('generateBtn');
+            btn.textContent = 'Generating PDF...';
+            btn.disabled = true;
+
+            const selectedTheme = document.getElementById('themeSelect').value;
+            const scheme = OBSIDIAN_SCHEMES[selectedTheme];
+
+            // Capture Graph Canvas
+            network.fit();
+            network.redraw();
+            const graphCanvas = document.querySelector('#mynetwork canvas');
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = graphCanvas.width; tempCanvas.height = graphCanvas.height;
+            const ctx = tempCanvas.getContext('2d');
+            ctx.fillStyle = scheme.bg; ctx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+            ctx.drawImage(graphCanvas, 0, 0);
+            const graphImgBase64 = tempCanvas.toDataURL('image/png');
+
+            const items = document.querySelectorAll('#sortable-list li');
+            const orderedFiles = Array.from(items).map(item => item.dataset.filename);
+
+            const jsPDFClass = window.jspdf ? window.jspdf.jsPDF : window.jsPDF;
+            if (!jsPDFClass) {
+                alert("Error: PDF engine failed to load. Please refresh the page.");
+                btn.textContent = 'Generate PDF Document';
+                btn.disabled = false;
+                return;
+            }
+
+            const pdf = new jsPDFClass({ unit: 'pt', format: 'a4', orientation: 'portrait' });
+            const stage = document.getElementById('pdf-render-stage');
+
+            const titleToId = {};
+            orderedFiles.forEach((fname, idx) => {
+                const title = fname.replace(/\.md\$/i, '');
+                titleToId[title] = `note-${idx + 1}`;
+            });
+
+            const pdfStyleHeader = `
+                <style>
+                    .pdf-page {
+                        background-color: ${scheme.bg};
+                        color: ${scheme.text};
+                        padding: 36px 40px;
+                        box-sizing: border-box;
+                        width: 794px;
+                        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                        font-size: 13.5px;
+                        line-height: 1.6;
+                        letter-spacing: -0.011em;
+                        word-wrap: break-word;
+                        overflow-wrap: break-word;
+                    }
+
+                    .pdf-page-graph {
+                        background-color: ${scheme.bg};
+                        color: ${scheme.text};
+                        padding: 36px 40px;
+                        box-sizing: border-box;
+                        width: 794px;
+                        height: 1123px;
+                        display: flex;
+                        flex-direction: column;
+                        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    }
+                    .pdf-page-graph h1 {
+                        color: ${scheme.title};
+                        border-bottom: 1px solid ${scheme.border};
+                        padding-bottom: 8px;
+                        margin-top: 0;
+                        margin-bottom: 16px;
+                        font-size: 22px;
+                        font-weight: 700;
+                        line-height: 1.3;
+                    }
+                    .graph-container {
+                        flex: 1;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        width: 100%;
+                        min-height: 0;
+                    }
+                    .graph-img {
+                        max-width: 100%;
+                        max-height: 980px;
+                        width: auto;
+                        height: auto;
+                        object-fit: contain;
+                        border-radius: 8px;
+                        border: 1px solid ${scheme.border};
+                    }
+
+                    h1 { color: ${scheme.title}; border-bottom: 1px solid ${scheme.border}; padding-bottom: 8px; margin-top: 0; margin-bottom: 16px; font-size: 22px; font-weight: 700; line-height: 1.3; }
+                    h2 { color: ${scheme.title}; margin-top: 22px; margin-bottom: 10px; font-size: 17px; font-weight: 600; }
+                    h3 { color: ${scheme.title}; margin-top: 18px; margin-bottom: 8px; font-size: 15px; font-weight: 600; }
+                    h4, h5, h6 { color: ${scheme.title}; margin-top: 14px; margin-bottom: 6px; font-size: 13.5px; font-weight: 600; }
+
+                    /* Clean Obsidian link styling - no border-bottom leeching into font text */
+                    a, a:visited {
+                        color: ${scheme.accent};
+                        text-decoration: none;
+                    }
+                    a.internal-link { 
+                        color: ${scheme.accent}; 
+                        text-decoration: none; 
+                        font-weight: 500; 
+                        border-bottom: none;
+                    }
+                    a.external-link { 
+                        color: ${scheme.accent}; 
+                        text-decoration: underline; 
+                        text-underline-offset: 3px;
+                        text-decoration-color: ${scheme.accent};
+                        text-decoration-skip-ink: auto;
+                        font-weight: 500; 
+                        border-bottom: none;
+                    }
+                    .unresolved-link { color: ${scheme.nodeUnresolved}; opacity: 0.85; font-style: italic; }
+
+                    .tags-container { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+                    .obsidian-tag {
+                        background-color: ${selectedTheme === 'dark' ? 'rgba(127, 109, 242, 0.18)' : 'rgba(108, 49, 232, 0.12)'};
+                        color: ${scheme.accent};
+                        padding: 3px 10px; border-radius: 12px;
+                        font-size: 11.5px; font-family: 'JetBrains Mono', monospace; font-weight: 500;
+                    }
+
+                    table { 
+                        width: 100% !important; 
+                        border-collapse: collapse; 
+                        margin: 18px 0; 
+                        table-layout: auto;
+                        word-break: normal;
+                        overflow-wrap: break-word;
+                    }
+                    th, td { 
+                        border: 1px solid ${scheme.border}; 
+                        padding: 7px 10px; 
+                        text-align: left; 
+                        vertical-align: top; 
+                        word-wrap: break-word; 
+                        overflow-wrap: break-word; 
+                    }
+                    th { background-color: ${scheme.th_bg}; font-weight: 600; color: ${scheme.title}; border-bottom: 2px solid ${scheme.border}; }
+                    tr:nth-child(even) { background-color: ${scheme.tr_even_bg}; }
+
+                    .wide-table table { font-size: 10px; line-height: 1.35; }
+                    .wide-table th, .wide-table td { padding: 5px 6px; }
+
+                    .ultra-wide-table table { font-size: 7.5px; line-height: 1.25; }
+                    .ultra-wide-table th, .ultra-wide-table td { padding: 3px 4px; }
+
+                    pre, code { font-family: 'JetBrains Mono', monospace; background-color: ${scheme.code_bg}; color: ${scheme.text}; border-radius: 4px; }
+                    code { padding: 2px 5px; font-size: 0.9em; }
+                    pre { padding: 12px 16px; border: 1px solid ${scheme.border}; white-space: pre-wrap; word-wrap: break-word; margin: 14px 0; line-height: 1.45; }
+                    pre code { padding: 0; background: transparent; }
+
+                    blockquote { border-left: 3px solid ${scheme.accent}; margin: 14px 0; padding: 8px 16px; background-color: ${scheme.quote_bg}; color: ${scheme.text}; border-radius: 0 4px 4px 0; }
+                    img { max-width: 100%; height: auto; display: block; margin: 14px auto; border-radius: 6px; }
+                    ul, ol { padding-left: 22px; margin: 10px 0; }
+                    li { margin-bottom: 4px; }
+                </style>
+            `;
+
+            // PASS 1: Pre-render DOM offscreen to compute page heights and target link mappings
+            const noteRenderData = [];
+            const noteIdToPdfPageMap = {};
+            let currentPdfPage = 2; // Page 1 reserved for Vault Graph View
+
+            const renderNoteFunc = pyodide.globals.get('render_note_to_html');
+
+            for (let idx = 0; idx < orderedFiles.length; idx++) {
+                const filename = orderedFiles[idx];
+                const title = filename.replace(/\.md\$/i, '');
+                const noteId = `note-${idx + 1}`;
+                const rawContent = vaultFiles[filename] || '';
+
+                const noteDataRaw = renderNoteFunc(
+                    filename, rawContent, JSON.stringify(vaultFiles), JSON.stringify(vaultAssets), JSON.stringify(titleToId)
+                );
+                const noteData = JSON.parse(noteDataRaw);
+
+                let tableClass = "";
+                if (noteData.cols >= 10) tableClass = "ultra-wide-table";
+                else if (noteData.cols >= 6) tableClass = "wide-table";
+
+                stage.innerHTML = `
+                    ${pdfStyleHeader}
+                    <div class="pdf-page ${tableClass}">
+                        <h1>${title}</h1>
+                        <div>${noteData.html}</div>
+                    </div>
+                `;
+
+                const element = stage.querySelector('.pdf-page');
+                const canvas = await html2canvas(element, { scale: 2, backgroundColor: scheme.bg, width: 794, logging: false });
+
+                const pdfWidth = pdf.internal.pageSize.getWidth();
+                const pdfHeight = pdf.internal.pageSize.getHeight();
+                const pageCanvasHeight = Math.floor((pdfHeight / pdfWidth) * canvas.width);
+                const totalPages = Math.max(1, Math.ceil(canvas.height / pageCanvasHeight));
+
+                const pageRect = element.getBoundingClientRect();
+                const pxToPt = pdfWidth / pageRect.width;
+                const links = Array.from(element.querySelectorAll('a')).map(a => ({
+                    rect: a.getBoundingClientRect(),
+                    href: a.getAttribute('href')
+                }));
+
+                noteIdToPdfPageMap[noteId] = currentPdfPage;
+
+                noteRenderData.push({
+                    canvas,
+                    pageCanvasHeight,
+                    totalPages,
+                    pageRect,
+                    pxToPt,
+                    links
+                });
+
+                currentPdfPage += totalPages;
+            }
+
+            renderNoteFunc.destroy();
+
+            // PASS 2: Construct PDF document with 1:1 aspect ratio preserved
+            const pdfWidth = pdf.internal.pageSize.getWidth();
+            const pdfHeight = pdf.internal.pageSize.getHeight();
+
+            // Page 1: Graph View (1:1 A4 Aspect Ratio Container)
+            stage.innerHTML = `
+                ${pdfStyleHeader}
+                <div class="pdf-page-graph">
+                    <h1>Vault Graph View</h1>
+                    <div class="graph-container">
+                        <img src="${graphImgBase64}" class="graph-img" />
+                    </div>
+                </div>
+            `;
+            
+            pdf.setFillColor(scheme.bg);
+            pdf.rect(0, 0, pdfWidth, pdfHeight, 'F');
+            const graphCanvasEl = await html2canvas(stage.querySelector('.pdf-page-graph'), { scale: 2, backgroundColor: scheme.bg, width: 794, logging: false });
+            pdf.addImage(graphCanvasEl.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pdfWidth, pdfHeight);
+
+            // Note Pages
+            for (let idx = 0; idx < noteRenderData.length; idx++) {
+                const item = noteRenderData[idx];
+
+                for (let pageIdx = 0; pageIdx < item.totalPages; pageIdx++) {
+                    pdf.addPage();
+                    pdf.setFillColor(scheme.bg);
+                    pdf.rect(0, 0, pdfWidth, pdfHeight, 'F');
+
+                    const subCanvas = document.createElement('canvas');
+                    subCanvas.width = item.canvas.width;
+                    subCanvas.height = item.pageCanvasHeight;
+                    const subCtx = subCanvas.getContext('2d');
+
+                    subCtx.fillStyle = scheme.bg;
+                    subCtx.fillRect(0, 0, subCanvas.width, subCanvas.height);
+
+                    const sourceY = pageIdx * item.pageCanvasHeight;
+                    const sourceH = Math.min(item.pageCanvasHeight, item.canvas.height - sourceY);
+
+                    subCtx.drawImage(
+                        item.canvas,
+                        0, sourceY, item.canvas.width, sourceH,
+                        0, 0, item.canvas.width, sourceH
+                    );
+
+                    pdf.addImage(subCanvas.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pdfWidth, pdfHeight);
+
+                    // Attach Link rects
+                    const pageSourceYStartPx = (pageIdx * item.pageCanvasHeight) / 2;
+                    const pageSourceYEndPx = pageSourceYStartPx + (item.pageCanvasHeight / 2);
+
+                    item.links.forEach(linkObj => {
+                        const relYPx = linkObj.rect.top - item.pageRect.top;
+
+                        if (relYPx >= pageSourceYStartPx && relYPx < pageSourceYEndPx) {
+                            const relXPx = linkObj.rect.left - item.pageRect.left;
+                            const linkX = relXPx * item.pxToPt;
+                            const linkY = (relYPx - pageSourceYStartPx) * item.pxToPt;
+                            const linkW = linkObj.rect.width * item.pxToPt;
+                            const linkH = linkObj.rect.height * item.pxToPt;
+
+                            const href = linkObj.href;
+                            if (href) {
+                                if (href.startsWith('#note-')) {
+                                    const targetNoteId = href.substring(1);
+                                    const targetPageNum = noteIdToPdfPageMap[targetNoteId];
+                                    if (targetPageNum) {
+                                        pdf.link(linkX, linkY, linkW, linkH, { pageNumber: targetPageNum });
+                                    }
+                                } else if (href.startsWith('http://') || href.startsWith('https://')) {
+                                    pdf.link(linkX, linkY, linkW, linkH, { url: href });
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            stage.innerHTML = '';
+            pdf.save('obsidian-stitched.pdf');
+
+            btn.textContent = 'Generate PDF Document';
+            btn.disabled = false;
+        });
+    </script>
+</body>
+</html>

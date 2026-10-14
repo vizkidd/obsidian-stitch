@@ -1,0 +1,6 @@
+Flask
+Markdown
+WeasyPrint
+networkx
+bs4
+pango

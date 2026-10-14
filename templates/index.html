@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Obsidian Vault Stitcher & PDF Exporter</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/dist/vis-network.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js"></script>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background: #18181a; 
+            color: #e0e0e0; 
+            display: flex; 
+            gap: 20px; 
+            height: 100vh; 
+            box-sizing: border-box; 
+        }
+        .panel { 
+            background: #242427; 
+            border-radius: 10px; 
+            padding: 20px; 
+            display: flex; 
+            flex-direction: column; 
+            border: 1px solid #333338;
+        }
+        #left-panel { flex: 1; min-width: 320px; max-width: 420px; }
+        #right-panel { flex: 2; display: flex; flex-direction: column; }
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .theme-select-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9em;
+            color: #aaa;
+        }
+        select.theme-dropdown {
+            background: #18181a;
+            color: #fff;
+            border: 1px solid #44444c;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.85em;
+            cursor: pointer;
+            outline: none;
+        }
+        #mynetwork { 
+            width: 100%; 
+            flex-grow: 1;
+            min-height: 480px;
+            border-radius: 8px; 
+            background: #1e1e20; 
+            border: 1px solid #333338;
+            transition: background 0.3s ease;
+        }
+        .file-list { 
+            list-style: none; 
+            padding: 0; 
+            margin: 15px 0; 
+            overflow-y: auto; 
+            flex-grow: 1; 
+        }
+        .file-list li { 
+            background: #2e2e33; 
+            margin-bottom: 8px; 
+            padding: 10px 14px; 
+            border-radius: 6px; 
+            cursor: grab; 
+            font-size: 0.9em;
+            display: flex; 
+            align-items: center; 
+            border-left: 4px solid #7852ee; 
+            user-select: none;
+        }
+        .file-list li:active { cursor: grabbing; }
+        .btn { 
+            background: #7852ee; 
+            color: white; 
+            border: none; 
+            padding: 12px 20px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            font-size: 15px; 
+            font-weight: 600; 
+            width: 100%;
+            transition: background 0.2s;
+        }
+        .btn:hover { background: #633ec7; }
+        .subtext { font-size: 0.82em; color: #888; margin-top: -5px; margin-bottom: 15px; }
+        h2 { font-size: 1.1em; margin: 0; color: #fff; }
+    </style>
+</head>
+<body>
+
+    <div class="panel" id="left-panel">
+        <h2>1. Select Vault Folder</h2>
+        <input type="file" id="fileInput" multiple webkitdirectory directory style="margin: 15px 0;">
+        <p class="subtext">Select your Obsidian vault directory containing Markdown and image files.</p>
+        
+        <h2>2. Order Document Pages</h2>
+        <p class="subtext">Drag items to arrange PDF layout sequence.</p>
+        <ul id="sortable-list" class="file-list"></ul>
+        
+        <button class="btn" id="generateBtn" style="display: none;">Generate PDF Document</button>
+    </div>
+
+    <div class="panel" id="right-panel">
+        <div class="header-row">
+            <h2>Graph View Overview</h2>
+            <div class="theme-select-container">
+                <label for="themeSelect">Theme Mode:</label>
+                <select id="themeSelect" class="theme-dropdown">
+                    <option value="dark" selected>Obsidian Dark</option>
+                    <option value="light">Obsidian Light</option>
+                </select>
+            </div>
+        </div>
+        <div id="mynetwork"></div>
+    </div>
+
+    <script>
+        let network = null;
+        let currentGraphData = null;
+
+        const OBSIDIAN_SCHEMES = {
+            dark: {
+                bg: '#1e1e20',
+                nodeAccent: '#7f6df2',
+                nodeUnresolved: '#6c6c70',
+                fontColor: '#dcddde',
+                edgeColor: '#4a4a4e',
+                borderHighlight: '#a882ff'
+            },
+            light: {
+                bg: '#ffffff',
+                nodeAccent: '#6c31e8',
+                nodeUnresolved: '#999999',
+                fontColor: '#222222',
+                edgeColor: '#cccccc',
+                borderHighlight: '#7852ee'
+            }
+        };
+
+        const sortable = new Sortable(document.getElementById('sortable-list'), {
+            animation: 150,
+            ghostClass: 'sortable-ghost'
+        });
+
+        function renderGraph(schemeKey) {
+            if (!currentGraphData) return;
+            
+            const scheme = OBSIDIAN_SCHEMES[schemeKey];
+            const container = document.getElementById('mynetwork');
+            container.style.backgroundColor = scheme.bg;
+
+            const updatedNodes = currentGraphData.nodes.map(n => ({
+                ...n,
+                color: {
+                    background: n.is_missing ? scheme.nodeUnresolved : scheme.nodeAccent,
+                    border: scheme.borderHighlight
+                },
+                font: {
+                    color: scheme.fontColor,
+                    size: 13,
+                    face: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
+                }
+            }));
+
+            if (network !== null) {
+                network.destroy();
+                network = null;
+            }
+
+            const graphData = {
+                nodes: new vis.DataSet(updatedNodes),
+                edges: new vis.DataSet(currentGraphData.edges)
+            };
+            
+            const options = {
+                nodes: { 
+                    shape: 'dot', 
+                    size: 16, 
+                    borderWidth: 1.5
+                },
+                edges: { 
+                    color: { color: scheme.edgeColor, highlight: scheme.borderHighlight }, 
+                    arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+                    smooth: { type: 'continuous' }
+                },
+                physics: { 
+                    solver: 'forceAtlas2Based',
+                    forceAtlas2Based: {
+                        gravitationalConstant: -40,
+                        centralGravity: 0.01,
+                        springLength: 90,
+                        springConstant: 0.08
+                    },
+                    stabilization: { enabled: true, iterations: 150 }
+                }
+            };
+
+            network = new vis.Network(container, graphData, options);
+
+            network.once('stabilizationIterationsDone', () => {
+                network.setOptions({ physics: false });
+                network.fit();
+            });
+        }
+
+        document.getElementById('themeSelect').addEventListener('change', (e) => {
+            renderGraph(e.target.value);
+        });
+
+        document.getElementById('fileInput').addEventListener('change', async (e) => {
+            const files = e.target.files;
+            if (files.length === 0) return;
+
+            const formData = new FormData();
+            for (let i = 0; i < files.length; i++) {
+                formData.append('files', files[i]);
+            }
+
+            const response = await fetch('/upload', { method: 'POST', body: formData });
+            const data = await response.json();
+
+            const list = document.getElementById('sortable-list');
+            list.innerHTML = '';
+            data.files.forEach(file => {
+                const li = document.createElement('li');
+                li.textContent = file;
+                li.dataset.filename = file;
+                list.appendChild(li);
+            });
+
+            document.getElementById('generateBtn').style.display = 'block';
+
+            currentGraphData = data.graph;
+            const currentTheme = document.getElementById('themeSelect').value;
+            renderGraph(currentTheme);
+        });
+
+        document.getElementById('generateBtn').addEventListener('click', async () => {
+            const items = document.querySelectorAll('#sortable-list li');
+            const orderedFiles = Array.from(items).map(item => item.dataset.filename);
+
+            const btn = document.getElementById('generateBtn');
+            btn.textContent = 'Generating PDF...';
+            btn.disabled = true;
+
+            const selectedTheme = document.getElementById('themeSelect').value;
+            const scheme = OBSIDIAN_SCHEMES[selectedTheme];
+
+            let graphImageBase64 = null;
+            if (network) {
+                network.fit();
+                
+                const canvas = document.querySelector('#mynetwork canvas');
+                if (canvas) {
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width = canvas.width;
+                    tempCanvas.height = canvas.height;
+                    const ctx = tempCanvas.getContext('2d');
+                    
+                    ctx.fillStyle = scheme.bg; 
+                    ctx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+                    ctx.drawImage(canvas, 0, 0);
+                    
+                    graphImageBase64 = tempCanvas.toDataURL('image/png');
+                }
+            }
+
+            const response = await fetch('/generate_pdf', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    ordered_files: orderedFiles,
+                    graph_image: graphImageBase64,
+                    theme: selectedTheme
+                })
+            });
+
+            const result = await response.json();
+            if (result.status === 'success') {
+                window.location.href = result.download_url;
+            }
+            btn.textContent = 'Generate PDF Document';
+            btn.disabled = false;
+        });
+    </script>
+</body>
+</html>
