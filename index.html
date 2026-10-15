@@ -128,6 +128,7 @@
                 </select></label>
             <label class="chk"><input type="checkbox" id="ascending"> Ascending (least referred first)</label>
             <label class="chk"><input type="checkbox" id="compact"> Compact: pack notes together, trim empty space</label>
+            <label class="chk"><input type="checkbox" id="landscape" checked> Landscape pages for notes with tables</label>
         </div>
         <div class="btn-row">
             <button class="mini" id="addGroupBtn">+ New group</button>
@@ -659,7 +660,7 @@ def render_note(path, compact, p2id_json):
 
             const selectedTheme = $('themeSelect').value;
             const scheme = OBSIDIAN_SCHEMES[selectedTheme];
-            const compact = $('compact').checked;
+            const compact = $('compact').checked, useLand = $('landscape').checked;
 
             // Capture Graph Canvas
             network.fit();
@@ -823,6 +824,9 @@ def render_note(path, compact, p2id_json):
                     .callout p:last-child { margin-bottom: 0; }
                     .embed { border-left: 3px solid ${scheme.accent}; background: ${scheme.quote_bg}; padding: 6px 14px; margin: 14px 0; border-radius: 0 4px 4px 0; }
                     .embed-title { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: ${scheme.nodeUnresolved}; margin-bottom: 6px; }
+                    .pdf-page.landscape { width: 1123px; }
+                    .landscape.wide-table table { font-size: 11px; line-height: 1.4; }
+                    .landscape.ultra-wide-table table { font-size: 9px; line-height: 1.3; }
                     .pdf-embed img { border: 1px solid ${scheme.border}; margin: 8px auto; }
                     .group-banner { font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase; color: ${scheme.accent}; margin-bottom: 8px; }
                     ${compact ? `
@@ -848,13 +852,24 @@ def render_note(path, compact, p2id_json):
                     const data = JSON.parse(renderFn(path, compact, JSON.stringify(p2id)));
                     const tableClass = data.cols >= 10 ? 'ultra-wide-table' : data.cols >= 6 ? 'wide-table' : '';
                     const banner = k === 0 ? `<div class="group-banner">${esc(g.name)}</div>` : '';
-                    stage.innerHTML = `${pdfStyleHeader}<div class="pdf-page ${tableClass}">${banner}<h1>${esc(title)}</h1><div>${data.html}</div></div>`;
-                    const element = stage.querySelector('.pdf-page');
+                    const build = cls => {
+                        stage.innerHTML = `${pdfStyleHeader}<div class="pdf-page ${cls}">${banner}<h1>${esc(title)}</h1><div>${data.html}</div></div>`;
+                        return stage.querySelector('.pdf-page');
+                    };
+                    // a table is truncated when it sticks out past the page's right padding
+                    const overflows = el => { const r = el.getBoundingClientRect().right - 39; return [...el.querySelectorAll('table')].some(t => t.getBoundingClientRect().right > r); };
+                    let element = build(tableClass), land = false;
                     await hydrate(element);
-                    const canvas = await html2canvas(element, { scale: 2, backgroundColor: scheme.bg, width: 794, logging: false });
+                    if (useLand && element.querySelector('table') && (data.cols >= 5 || overflows(element))) {
+                        land = true;  // re-render this note on a landscape page
+                        element = build(tableClass + ' landscape');
+                        await hydrate(element);
+                        if (overflows(element)) { element = build('ultra-wide-table landscape'); await hydrate(element); }
+                    }
+                    const canvas = await html2canvas(element, { scale: 2, backgroundColor: scheme.bg, width: land ? 1123 : 794, logging: false });
                     const pageRect = element.getBoundingClientRect();
                     items.push({
-                        gi, title, noteId: p2id[path], canvas, pageRect, hPx: canvas.height / 2,
+                        gi, title, land, noteId: p2id[path], canvas, pageRect, hPx: canvas.height / 2,
                         links: [...element.querySelectorAll('a')].map(a => ({ rect: a.getBoundingClientRect(), href: a.getAttribute('href') })),
                         textItems: extractTextItems(element, pageRect)
                     });
@@ -863,16 +878,19 @@ def render_note(path, compact, p2id_json):
             renderFn.destroy();
 
             // LAYOUT: normal = each note starts a new page; compact = notes flow continuously
-            const PAGE_H = Math.floor(794 * PH / PW), pages = [[]], notePage = {};
-            let y = 0;
-            const newPage = () => { pages.push([]); y = 0; };
+            const PORT_H = Math.floor(794 * PH / PW), LAND_H = Math.floor(1123 * PW / PH), pages = [], notePage = {};
+            const hOf = l => l ? LAND_H : PORT_H;
+            let y = 0, cur = null;
+            const newPage = land => { cur = []; cur.land = land; pages.push(cur); y = 0; };
             items.forEach(it => {
-                if (y > 0 && (!compact || PAGE_H - y < 90)) newPage(); else if (y > 0) y += 12;
+                const H = hOf(it.land);
+                // orientation changes always start a new page
+                if (!cur || cur.land !== it.land || (y > 0 && (!compact || H - y < 90))) newPage(it.land); else if (y > 0) y += 12;
                 notePage[it.noteId] = pages.length + 1;  // +1: page 1 is the graph
                 for (let src = 0; src < it.hPx - 0.5;) {
-                    if (y >= PAGE_H - 1) newPage();
-                    const h = Math.min(PAGE_H - y, it.hPx - src);
-                    pages[pages.length - 1].push({ it, src, h, y });
+                    if (y >= H - 1) newPage(it.land);
+                    const h = Math.min(H - y, it.hPx - src);
+                    cur.push({ it, src, h, y });
                     src += h; y += h;
                 }
             });
@@ -904,18 +922,19 @@ def render_note(path, compact, p2id_json):
             // PASS 2: draw pages, invisible text layer and link hotspots
             setStatus('Assembling PDF...');
             pages.forEach(slices => {
-                pdf.addPage();
+                const land = slices.land, pgW = land ? pdfHeight : pdfWidth, pgH = land ? pdfWidth : pdfHeight;
+                pdf.addPage('a4', land ? 'landscape' : 'portrait');
                 const cv = document.createElement('canvas');
-                cv.width = 794 * 2; cv.height = PAGE_H * 2;
+                cv.width = (land ? 1123 : 794) * 2; cv.height = hOf(land) * 2;
                 const c2 = cv.getContext('2d');
                 c2.fillStyle = scheme.bg; c2.fillRect(0, 0, cv.width, cv.height);
                 slices.forEach(s => c2.drawImage(s.it.canvas, 0, s.src * 2, s.it.canvas.width, s.h * 2, 0, s.y * 2, cv.width, s.h * 2));
                 pdf.setFillColor(scheme.bg);
-                pdf.rect(0, 0, pdfWidth, pdfHeight, 'F');
-                pdf.addImage(cv.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pdfWidth, pdfHeight);
+                pdf.rect(0, 0, pgW, pgH, 'F');
+                pdf.addImage(cv.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pgW, pgH);
 
                 slices.forEach(({ it, src, h, y }) => {
-                    const k = pdfWidth / it.pageRect.width, dy = y - src;
+                    const k = pgW / it.pageRect.width, dy = y - src;
                     pdf.setFont("helvetica", "normal");
                     it.textItems.forEach(t => {
                         if (t.relY >= src && t.relY < src + h) {
