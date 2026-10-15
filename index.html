@@ -21,6 +21,9 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 
+    <!-- PDF.js (rasterises embedded PDFs) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
     <!-- Pyodide WASM Runtime -->
     <script src="https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js"></script>
 
@@ -74,6 +77,23 @@
             z-index: 1;
             pointer-events: none;
         }
+        #left-panel { overflow-y: auto; }
+        #left-panel > * { flex-shrink: 0; }
+        .ctrl-grid { display: grid; gap: 8px; margin: 8px 0 12px; font-size: 0.82em; color: #bbb; }
+        .ctrl-grid label { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+        .ctrl-grid label.chk { justify-content: flex-start; }
+        .btn-row { display: flex; gap: 8px; margin-bottom: 8px; }
+        .mini { background: #2e2e33; color: #ddd; border: 1px solid #44444c; border-radius: 6px; padding: 6px 10px; font-size: 0.8em; cursor: pointer; }
+        .group { background: #1e1e20; border: 1px solid #333338; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+        .group-head { display: flex; align-items: center; gap: 8px; }
+        .grp-handle { cursor: grab; color: #777; }
+        .grp-name { flex: 1; min-width: 0; font-weight: 600; font-size: 0.88em; color: #fff; outline: none; }
+        .grp-meta { font-size: 0.72em; color: #777; margin: 2px 0 6px 22px; }
+        .group .file-list { margin: 0; flex-grow: 0; min-height: 14px; }
+        .file-list li .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .badge { font-size: 0.75em; color: #a78bfa; margin: 0 8px; }
+        .x { background: none; border: none; color: #777; cursor: pointer; font-size: 0.9em; }
+        .x:hover { color: #f66; }
     </style>
 </head>
 <body>
@@ -81,18 +101,40 @@
     <div class="panel" id="left-panel">
         <h2>1. Import Vault Content</h2>
         <div class="upload-group" style="margin-top: 10px;">
-            <span class="upload-label">Import Folder:</span>
+            <span class="upload-label">Import Folder (sub-directories are kept as groups):</span>
             <input type="file" id="folderInput" multiple webkitdirectory directory disabled>
         </div>
         <div class="upload-group">
             <span class="upload-label">Import Individual Files:</span>
-            <input type="file" id="fileInput" multiple accept=".md,.png,.jpg,.jpeg,.gif,.svg,.webp" disabled>
+            <input type="file" id="fileInput" multiple accept=".md,.pdf,.png,.jpg,.jpeg,.gif,.svg,.webp" disabled>
         </div>
-        <p class="subtext">Select an Obsidian vault folder or individual Markdown & image files.</p>
+        <p class="subtext">Markdown notes, plus PDFs and images used by ![[embeds]].</p>
 
-        <h2>2. Order Document Pages</h2>
-        <p class="subtext">Drag items to arrange PDF layout sequence.</p>
-        <ul id="sortable-list" class="file-list"></ul>
+        <h2>2. Group &amp; Order Notes</h2>
+        <div class="ctrl-grid">
+            <label>Group by
+                <select id="groupBy" class="theme-dropdown">
+                    <option value="folders">Folders (keep directories)</option>
+                    <option value="clusters">Graph clusters</option>
+                </select></label>
+            <label>Order by
+                <select id="orderBy" class="theme-dropdown">
+                    <option value="name">Name (A-Z)</option>
+                    <option value="refs">Most referred (incoming links)</option>
+                    <option value="size">Size (nodes)</option>
+                    <option value="edges">Edges</option>
+                    <option value="occupancy">Occupancy (edge density)</option>
+                    <option value="dof">Degrees of freedom (independent cycles)</option>
+                </select></label>
+            <label class="chk"><input type="checkbox" id="ascending"> Ascending (least referred first)</label>
+            <label class="chk"><input type="checkbox" id="compact"> Compact: pack notes together, trim empty space</label>
+        </div>
+        <div class="btn-row">
+            <button class="mini" id="addGroupBtn">+ New group</button>
+            <button class="mini" id="restoreBtn" style="display:none">Restore removed</button>
+        </div>
+        <p class="subtext">Drag notes between groups, drag &#10303; to reorder groups, click a group name to rename it.</p>
+        <div id="groups"></div>
 
         <button class="btn" id="generateBtn" style="display: none;">Generate PDF Document</button>
         <div id="status-box">Loading Python WASM Runtime...</div>
@@ -114,6 +156,201 @@
 
     <div id="pdf-render-stage"></div>
 
+    <script type="text/x-python" id="py-src">
+import re, json, markdown
+
+WIKI = re.compile(r'(?<!!)\[\[(.*?)\]\]')
+EMBED = re.compile(r'!\[\[(.*?)\]\]')
+ANYLINK = re.compile(r'!?\[\[(.*?)\]\]')
+IMG_EXT = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')
+VAULT, ASSETS, NOTE_IDX, ASSET_IDX = {}, [], {}, {}
+CALLOUT_CLS = {'tip': 'ok', 'success': 'ok', 'check': 'ok', 'done': 'ok', 'warning': 'warn', 'caution': 'warn',
+               'attention': 'warn', 'danger': 'bad', 'error': 'bad', 'bug': 'bad', 'failure': 'bad', 'fail': 'bad',
+               'quote': 'mute', 'cite': 'mute'}
+
+def esc(s): return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+def norm(t):
+    t = (t or '').strip().replace('\\', '/')
+    return (t[:-3] if t.lower().endswith('.md') else t).strip().lower()
+def title_of(p):
+    b = p.rsplit('/', 1)[-1]
+    return b[:-3] if b.lower().endswith('.md') else b
+def dname(p): return p.rsplit('/', 1)[0] if '/' in p else ''
+def key_of(p, strip): return norm(p) if strip else p.lower()
+def build_idx(paths, strip):
+    idx = {}
+    for p in paths: idx.setdefault(key_of(p, strip).rsplit('/', 1)[-1], []).append(p)
+    return idx
+
+def load_vault(files_json, assets_json):
+    global VAULT, ASSETS, NOTE_IDX, ASSET_IDX
+    VAULT, ASSETS = json.loads(files_json), json.loads(assets_json)
+    NOTE_IDX, ASSET_IDX = build_idx(list(VAULT), True), build_idx(ASSETS, False)
+
+def pick(target, src, idx, strip):
+    key = norm(target) if strip else target.strip().replace('\\', '/').lower()
+    c = idx.get(key.rsplit('/', 1)[-1], [])
+    if '/' in key: c = [p for p in c if key_of(p, strip).endswith(key)]
+    return min(c, key=lambda p: dname(p) != dname(src)) if c else None  # prefer same folder
+
+def split_target(raw):
+    t, _, alias = raw.partition('|')
+    t, alias, frag = t.strip(), alias.strip() or None, ''
+    if '#' in t: t, frag = t.split('#', 1)
+    return t.split('^')[0].strip(), frag.strip(), alias
+
+def valid(t):
+    t = t.strip()
+    return bool(t) and not t.lstrip('-+').isdigit() and not t.lower().endswith(IMG_EXT + ('.pdf', '.doc', '.docx'))
+
+def build_graph(active_json):
+    active = json.loads(active_json)
+    nodes, edges, miss, p2n = [], set(), {}, {}
+    for p in active:
+        p2n[p] = len(nodes) + 1
+        nodes.append({'id': p2n[p], 'label': title_of(p), 'path': p, 'is_missing': False})
+    for p in active:
+        for raw in ANYLINK.findall(VAULT[p]):  # links and embeds both count as references
+            t = split_target(raw)[0]
+            if not valid(t): continue
+            q = pick(t, p, NOTE_IDX, True)
+            if q is None:
+                k = norm(t)
+                if k not in miss:
+                    miss[k] = len(nodes) + 1
+                    nodes.append({'id': miss[k], 'label': t, 'is_missing': True})
+                tid = miss[k]
+            elif q in p2n: tid = p2n[q]
+            else: continue  # target was removed by the user
+            if tid != p2n[p]: edges.add((p2n[p], tid))
+    return json.dumps({'nodes': nodes, 'edges': [{'from': a, 'to': b} for a, b in sorted(edges)], 'files': active})
+
+def frontmatter(content):
+    m = re.match(r'^---\s*\n(.*?)\n---\s*(?:\n|$)', content, re.S)
+    tags = []
+    if m:
+        fm, content = m.group(1), content[m.end():]
+        tm = re.search(r'^tags:[ \t]*(.*)$', fm, re.M)
+        if tm:
+            raw = tm.group(1).strip()
+            if raw: tags = [t.strip(' []"\'#') for t in re.split(r'[,\s]+', raw)]
+            else:
+                blk = re.search(r'^tags:[ \t]*\n((?:[ \t]*-[^\n]*\n?)+)', fm + '\n', re.M)
+                if blk: tags = [l.strip(' -"\'#') for l in blk.group(1).splitlines()]
+    return content, [t for t in tags if t]
+
+def section(body, heading):
+    lines, h = body.split('\n'), heading.strip().lower()
+    for i, l in enumerate(lines):
+        m = re.match(r'(#{1,6})\s+(.*?)\s*#*\s*$', l)
+        if m and m.group(2).strip().lower() == h:
+            out = [l]
+            for l2 in lines[i + 1:]:
+                m2 = re.match(r'(#{1,6})\s', l2)
+                if m2 and len(m2.group(1)) <= len(m.group(1)): break
+                out.append(l2)
+            return '\n'.join(out)
+    return body
+
+def render_md(content, src, ctx, stack):
+    body = re.sub(r'%%.*?%%', '', frontmatter(content)[0], flags=re.S)
+    held = []
+    def hold(html):
+        held.append(html)
+        return 'ZZEMBEDZZ%dZZ' % (len(held) - 1)
+
+    def esub(m):
+        t, frag, alias = split_target(m.group(1))
+        low = t.lower()
+        if low.endswith(IMG_EXT):
+            p = pick(t, src, ASSET_IDX, False)
+            if not p: return hold('<span class="unresolved-link">[missing image: %s]</span>' % esc(t))
+            w = (' style="width:%spx"' % alias.split('x')[0]) if alias and re.match(r'^\d+(x\d+)?$', alias) else ''
+            return hold('<img data-asset="%s" alt="%s"%s/>' % (esc(p), esc(t), w))
+        if low.endswith('.pdf'):
+            p = pick(t, src, ASSET_IDX, False)
+            if not p: return hold('<span class="unresolved-link">[missing PDF: %s]</span>' % esc(t))
+            pg = re.match(r'page=(\d+)', frag)
+            return hold('<div class="pdf-embed" data-pdf="%s" data-page="%s"></div>' % (esc(p), pg.group(1) if pg else ''))
+        p = pick(t, src, NOTE_IDX, True)
+        if not p or p in stack or len(stack) > 6:
+            return hold('<blockquote><em>[%s: %s]</em></blockquote>' % ('Cyclic embed' if p else 'Missing note', esc(t)))
+        sub, heading = VAULT[p], (frag if frag and not frag.startswith('^') else '')
+        if heading: sub = section(frontmatter(sub)[0], heading)
+        inner = render_md(sub, p, ctx, stack + [p])
+        return hold('<div class="embed"><div class="embed-title">%s</div>%s</div>'
+                    % (esc(title_of(p) + (' \u203a ' + heading if heading else '')), inner))
+
+    def lsub(m):
+        t, frag, alias = split_target(m.group(1))
+        label = esc(alias or (t + (' \u203a ' + frag if frag and t else '')) or frag)
+        if not t: return label
+        q = pick(t, src, NOTE_IDX, True)
+        if q in ctx['p2id']: return '<a href="#%s" class="internal-link">%s</a>' % (ctx['p2id'][q], label)
+        return '<span class="unresolved-link">%s</span>' % label
+
+    LIST = r'(?:[-*+]|\d+\.)\s'
+    def indent(m):
+        n = len(m.group(1))
+        return ' ' * (n * 2 if n % 4 == 2 else n)  # Obsidian 2-space nesting -> Python-Markdown 4-space
+
+    def xform(s):
+        s = WIKI.sub(lsub, EMBED.sub(esub, s))
+        s = re.sub(r'==(?=\S)(.+?)(?<=\S)==', r'<mark>\1</mark>', s)
+        s = re.sub(r'~~(?=\S)(.+?)(?<=\S)~~', r'<del>\1</del>', s)
+        s = re.sub(r'(^|[\s(])#([A-Za-z][\w/-]*)', r'\1<span class="obsidian-tag">#\2</span>', s)
+        s = re.sub(r'[ \t]+\^[A-Za-z0-9-]+$', '', s, flags=re.M).replace('\t', '    ')
+        s = re.sub(r'^( +)(?=' + LIST + ')', indent, s, flags=re.M)
+        return re.sub(r'^(?=\S)(?!' + LIST + r')(.+)\n(?=\s*' + LIST + ')', r'\1\n\n', s, flags=re.M)
+
+    parts = re.split(r'(```.*?```|~~~.*?~~~|`[^`\n]+`)', body, flags=re.S)  # leave code untouched
+    body = ''.join(p if i % 2 else xform(p) for i, p in enumerate(parts))
+    html = markdown.markdown(body, extensions=['tables', 'fenced_code', 'sane_lists', 'footnotes', 'attr_list',
+                                               'def_list', 'md_in_html', 'nl2br'])
+    for i, h in enumerate(held):
+        tok = 'ZZEMBEDZZ%dZZ' % i
+        html = html.replace('<p>%s</p>' % tok, h).replace(tok, h)
+    return html
+
+URL_RE = re.compile(r'(<a\b[^>]*>.*?</a>|<[^>]+>)|(https?://[^\s<>"\)]+)', re.I | re.S)
+def linkify(html):
+    def r(m):
+        if m.group(1): return m.group(1)
+        u, tail = m.group(2), ''
+        while u and u[-1] in '.,;:!': tail, u = u[-1] + tail, u[:-1]
+        return '<a href="%s" target="_blank" class="external-link">%s</a>%s' % (u, u, tail)
+    return URL_RE.sub(r, html)
+
+def post(html, compact):
+    def task(m):
+        ch = m.group(2)
+        on, part = ch in 'xX', ch in '-/'
+        return '<li class="task">%s<span class="cb%s">%s</span> ' % (m.group(1) or '', ' on' if on else (' part' if part else ''), '\u2713' if on else ('\u2013' if part else ''))
+    def callout(m):
+        mm = re.match(r'\s*<p>\[!(\w+)\][+-]?[ \t]*(.*?)(<br />\s*|</p>)(.*)', m.group(1), re.S)
+        if not mm: return m.group(0)
+        kind, title, sep, rest = mm.groups()
+        body = '<p>' + rest if sep.startswith('<br') else rest
+        return '<div class="callout %s"><div class="callout-title">%s</div>%s</div>' % (CALLOUT_CLS.get(kind.lower(), 'info'), title or kind.title(), body)
+    html = re.sub(r'<li>(\s*<p>)?\[([ xX/-])\]\s+', task, html)
+    html = re.sub(r'<blockquote>(\s*<p>\[!\w+\].*?)</blockquote>', callout, html, flags=re.S)
+    if compact:  # trim empty paragraphs and runs of line breaks
+        html = re.sub(r'<p>(\s|<br\s*/?>)*</p>', '', html)
+        html = re.sub(r'(<br\s*/?>\s*){2,}', '<br />\n', html)
+    return html
+
+def table_cols(md):
+    return max([len(l.strip().strip('|').split('|')) for l in md.splitlines() if l.strip().startswith('|')] or [0])
+
+def render_note(path, compact, p2id_json):
+    ctx = {'p2id': json.loads(p2id_json), 'compact': compact}
+    raw = VAULT[path]
+    tags = frontmatter(raw)[1]
+    html = post(linkify(render_md(raw, path, ctx, [path])), compact)
+    if tags: html = '<div class="tags-container">%s</div>' % ''.join('<span class="obsidian-tag">#%s</span>' % esc(t) for t in tags) + html
+    return json.dumps({'html': html, 'cols': table_cols(raw)})
+</script>
+
     <script>
         let pyodide = null;
         let network = null;
@@ -134,7 +371,6 @@
             }
         };
 
-        const sortable = new Sortable(document.getElementById('sortable-list'), { animation: 150 });
 
         async function initWasm() {
             pyodide = await loadPyodide();
@@ -143,171 +379,7 @@
             await micropip.install("markdown");
             micropip.destroy();
 
-            pyodide.runPython(`
-import re
-import json
-import markdown
-
-WIKILINK_RE = re.compile(r'(?<!\\!)\\[\\[(.*?)\\]\\]')
-EMBED_RE = re.compile(r'\\!\\[\\[(.*?)\\]\\]')
-IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')
-
-def norm_title(title):
-    if not title: return ""
-    t = title.strip()
-    if t.lower().endswith('.md'):
-        t = t[:-3]
-    return t.strip().lower()
-
-def is_valid_node_title(title):
-    if not title: return False
-    t = title.strip()
-    if not t or t.lstrip('-+').isdigit(): return False
-    if any(t.lower().endswith(ext) for ext in ('.pdf', '.doc', '.docx')): return False
-    return True
-
-def process_vault_graph(files_json):
-    files = json.loads(files_json)
-    md_files = [f for f in files.keys() if f.lower().endswith('.md')]
-    all_titles = {norm_title(f): f for f in md_files}
-
-    node_map = {}
-    nodes = []
-    edges = []
-
-    def get_or_create_node(raw_title):
-        clean_t = norm_title(raw_title)
-        if clean_t not in node_map:
-            node_id = len(node_map) + 1
-            node_map[clean_t] = node_id
-            is_missing = clean_t not in all_titles
-            nodes.append({"id": node_id, "label": raw_title.strip(), "is_missing": is_missing})
-        return node_map[clean_t]
-
-    for fname in md_files:
-        title = fname[:-3] if fname.lower().endswith('.md') else fname
-        source_id = get_or_create_node(title)
-        content = files[fname]
-        links = WIKILINK_RE.findall(content)
-
-        for link in links:
-            target = link.split('|')[0].strip()
-            if '#' in target: target = target.split('#')[0].strip()
-            if '^' in target: target = target.split('^')[0].strip()
-
-            if not is_valid_node_title(target): continue
-            target_id = get_or_create_node(target)
-            edges.append({"from": source_id, "to": target_id})
-
-    return json.dumps({"graph": {"nodes": nodes, "edges": edges}, "files": md_files})
-
-def analyze_table_columns(md_content):
-    max_cols = 0
-    for line in md_content.splitlines():
-        if '|' in line:
-            cols = [c.strip() for c in line.split('|') if c.strip()]
-            if len(cols) > max_cols: max_cols = len(cols)
-    return max_cols
-
-def parse_frontmatter(content):
-    fm_match = re.match(r'^---\\s*\\n(.*?)\\n---\\s*\\n', content, re.DOTALL)
-    tags_html = ""
-    if fm_match:
-        fm_text = fm_match.group(1)
-        content = content[fm_match.end():]
-        tags = []
-        tag_match = re.search(r'tags:\\s*([^\\n]+)', fm_text)
-        if tag_match:
-            raw_tags = tag_match.group(1)
-            tags = [t.strip(' -[],"') for t in re.split(r'[, ]+', raw_tags) if t.strip(' -[],"')]
-        else:
-            tag_block = re.search(r'tags:\\s*\\n((?:\\s*-[^\\n]+\\n?)+)', fm_text)
-            if tag_block:
-                tags = [t.strip(' -[],"') for t in tag_block.group(1).splitlines() if t.strip(' -[],"')]
-        
-        if tags:
-            pills = "".join([f'<span class="obsidian-tag">#{t}</span>' for t in tags if t])
-            if pills:
-                tags_html = f'<div class="tags-container">{pills}</div>'
-                
-    return content, tags_html
-
-def linkify_html(html):
-    tag_or_url_pattern = re.compile(r'(<a\\b[^>]*>.*?</a>|<[^>]+>)|(https?://[^\\s<>"\\)]+)', re.IGNORECASE | re.DOTALL)
-    
-    def replacer(match):
-        if match.group(1):
-            return match.group(1)
-        url = match.group(2)
-        trailing = ""
-        while url and url[-1] in '.,;:!':
-            trailing = url[-1] + trailing
-            url = url[:-1]
-        return f'<a href="{url}" target="_blank" class="external-link">{url}</a>{trailing}'
-
-    return tag_or_url_pattern.sub(replacer, html)
-
-def render_note_to_html(filename, content, files_json, assets_json, title_to_id_json):
-    files_map = json.loads(files_json)
-    assets_map = json.loads(assets_json)
-    raw_title_to_id = json.loads(title_to_id_json)
-    
-    title_to_id = {norm_title(k): v for k, v in raw_title_to_id.items()}
-    processed_embeds = set()
-
-    content, tags_html = parse_frontmatter(content)
-
-    def embed_sub(match):
-        try:
-            raw = match.group(1).strip()
-        except IndexError:
-            return match.group(0)
-
-        parts = raw.split('|')
-        target = parts[0].strip()
-        clean_target = target.split('#')[0].strip()
-
-        if clean_target.lower().endswith(IMAGE_EXTENSIONS):
-            if clean_target in assets_map:
-                return f'<img src="{assets_map[clean_target]}" alt="{clean_target}" style="max-width:100%; height:auto; display:block; margin:12px auto;"/>'
-            return f'> *[Image Asset Missing: {clean_target}]*'
-
-        md_target = clean_target if clean_target.lower().endswith('.md') else f"{clean_target}.md"
-        if md_target in files_map and md_target not in processed_embeds:
-            processed_embeds.add(md_target)
-            return files_map[md_target]
-
-        return f'> *[Missing Transclusion: {clean_target}]*'
-
-    content = EMBED_RE.sub(embed_sub, content)
-
-    def wikilink_sub(match):
-        try:
-            raw = match.group(1).strip()
-        except IndexError:
-            return match.group(0)
-
-        parts = raw.split('|')
-        target_raw = parts[0].strip()
-        alias = parts[1].strip() if len(parts) > 1 else target_raw
-        clean_target = target_raw.split('#')[0].split('^')[0].strip()
-        norm_key = norm_title(clean_target)
-
-        if norm_key in title_to_id:
-            return f'<a href="#{title_to_id[norm_key]}" class="internal-link">{alias}</a>'
-        return f'<span class="unresolved-link">{alias}</span>'
-
-    content = WIKILINK_RE.sub(wikilink_sub, content)
-
-    html = markdown.markdown(content, extensions=['tables', 'fenced_code', 'sane_lists'])
-    html = linkify_html(html)
-    cols = analyze_table_columns(content)
-
-    if tags_html:
-        html = tags_html + html
-
-    return json.dumps({"html": html, "cols": cols})
-            `);
+            pyodide.runPython(document.getElementById('py-src').textContent);
 
             document.getElementById('status-box').textContent = "WASM Ready";
             document.getElementById('folderInput').disabled = false;
@@ -334,7 +406,7 @@ def render_note_to_html(filename, content, files_json, assets_json, title_to_id_
                 nodes: new vis.DataSet(updatedNodes),
                 edges: new vis.DataSet(currentGraphData.edges)
             }, {
-                nodes: { shape: 'dot', size: 16, borderWidth: 1.5 },
+                nodes: { shape: 'dot', size: 16, borderWidth: 1.5, scaling: { min: 10, max: 30 } },
                 edges: { 
                     color: { color: scheme.edgeColor, highlight: scheme.borderHighlight, hover: scheme.borderHighlight }, 
                     width: 2.5,
@@ -352,56 +424,242 @@ def render_note_to_html(filename, content, files_json, assets_json, title_to_id_
 
         document.getElementById('themeSelect').addEventListener('change', (e) => renderGraph(e.target.value));
 
-        async function handleFileImport(files) {
-            vaultFiles = {};
-            vaultAssets = {};
+        const $ = id => document.getElementById(id);
+        const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        const baseName = p => p.split('/').pop().replace(/\.md$/i, '');
+        let vaultPdfs = {}, pdfPages = {}, removed = new Set();
+        let G = { nodes: [], edges: [], files: [] }, indeg = {}, pathId = {};
 
-            for (let f of files) {
-                if (f.name.startsWith('.')) continue;
-                
-                const ext = f.name.substring(f.name.lastIndexOf('.')).toLowerCase();
-                
-                if (ext === '.md') {
-                    vaultFiles[f.name] = await f.text();
-                } else if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'].includes(ext)) {
-                    vaultAssets[f.name] = await new Promise((resolve) => {
-                        const reader = new FileReader();
-                        reader.onload = (e) => resolve(e.target.result);
-                        reader.readAsDataURL(f);
-                    });
-                }
-            }
+        new Sortable($('groups'), { handle: '.grp-handle', animation: 150 });
 
-            const pyFunc = pyodide.globals.get('process_vault_graph');
-            const pyResult = pyFunc(JSON.stringify(vaultFiles));
-            pyFunc.destroy();
-
-            const data = JSON.parse(pyResult);
-
-            const list = document.getElementById('sortable-list');
-            list.innerHTML = '';
-            data.files.forEach(file => {
-                const li = document.createElement('li');
-                li.textContent = file;
-                li.dataset.filename = file;
-                list.appendChild(li);
+        // ---- Graph metrics ----
+        function uf(ids) {
+            const p = new Map(ids.map(i => [i, i]));
+            const f = x => { while (p.get(x) !== x) { p.set(x, p.get(p.get(x))); x = p.get(x); } return x; };
+            return { f, u: (a, b) => p.set(f(a), f(b)) };
+        }
+        function components() {
+            const { f, u } = uf(G.nodes.map(n => n.id)), m = {};
+            G.edges.forEach(e => u(e.from, e.to));
+            G.nodes.forEach(n => (m[f(n.id)] ||= new Set()).add(n.id));
+            return Object.values(m);
+        }
+        function computeMetrics(set) {
+            const { f, u } = uf([...set]);
+            let edges = 0, refs = 0;
+            G.edges.forEach(e => {
+                if (set.has(e.to)) refs++;
+                if (set.has(e.from) && set.has(e.to)) { edges++; u(e.from, e.to); }
             });
-
-            document.getElementById('generateBtn').style.display = 'block';
-            currentGraphData = data.graph;
-            renderGraph(document.getElementById('themeSelect').value);
+            const size = set.size, c = new Set([...set].map(f)).size;
+            return { size, edges, refs, occupancy: size > 1 ? edges / (size * (size - 1)) : 0, dof: edges - size + c };
         }
 
-        document.getElementById('folderInput').addEventListener('change', (e) => handleFileImport(e.target.files));
-        document.getElementById('fileInput').addEventListener('change', (e) => handleFileImport(e.target.files));
+        // ---- Groups UI ----
+        function makeLi(p) {
+            const li = document.createElement('li');
+            li.dataset.filename = p; li.title = p;
+            li.innerHTML = '<span class="nm"></span><span class="badge" title="Incoming references"></span><button class="x" title="Remove note">&#10005;</button>';
+            li.querySelector('.nm').textContent = baseName(p);
+            li.querySelector('.badge').textContent = '\u21A9 ' + (indeg[pathId[p]] || 0);
+            return li;
+        }
+        function makeGroup(name, files, m) {
+            const d = document.createElement('div');
+            d.className = 'group';
+            d.innerHTML = '<div class="group-head"><span class="grp-handle" title="Drag to reorder">&#10303;</span><span class="grp-name" contenteditable="true" spellcheck="false"></span><button class="x grp-del" title="Remove group and its notes">&#10005;</button></div><div class="grp-meta"></div><ul class="file-list"></ul>';
+            d.querySelector('.grp-name').textContent = name;
+            if (m) d.querySelector('.grp-meta').textContent = `${m.size} nodes \u00B7 ${m.edges} edges \u00B7 occupancy ${(m.occupancy * 100).toFixed(1)}% \u00B7 dof ${m.dof} \u00B7 refs ${m.refs}`;
+            const ul = d.querySelector('ul');
+            files.forEach(p => ul.appendChild(makeLi(p)));
+            new Sortable(ul, { group: 'notes', animation: 150 });
+            return d;
+        }
+        function buildGroups() {
+            const mode = $('groupBy').value, asc = $('ascending').checked, dir = asc ? 1 : -1;
+            const k = $('orderBy').value === 'name' && mode === 'clusters' ? 'size' : $('orderBy').value;
+            const byId = {}; G.nodes.forEach(n => byId[n.id] = n);
+            let groups;
+            if (mode === 'folders') {
+                const m = {};
+                G.files.forEach(p => (m[p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '(root)'] ||= []).push(p));
+                groups = Object.entries(m).map(([name, files]) => ({ name, files }));
+            } else {
+                groups = components().map(s => ({ files: [...s].map(i => byId[i].path).filter(Boolean), set: s })).filter(g => g.files.length);
+            }
+            groups.forEach(g => { g.set ||= new Set(g.files.map(p => pathId[p])); g.m = computeMetrics(g.set); });
+            groups.sort((a, b) => k === 'name' ? a.name.localeCompare(b.name) : (a.m[k] - b.m[k]) * dir || b.m.refs - a.m.refs);
+            groups.forEach((g, i) => {
+                if (mode === 'clusters') g.name = `Cluster ${i + 1}`;
+                g.files.sort((a, b) => k === 'name' ? a.localeCompare(b) : (indeg[pathId[a]] - indeg[pathId[b]]) * dir || a.localeCompare(b));
+            });
+            return groups;
+        }
+        function renderGroups() {
+            const root = $('groups');
+            root.innerHTML = '';
+            buildGroups().forEach(g => root.appendChild(makeGroup(g.name, g.files, g.m)));
+        }
+        function refreshGraph(regroup) {
+            const active = Object.keys(vaultFiles).filter(p => !removed.has(p));
+            const fn = pyodide.globals.get('build_graph');
+            G = JSON.parse(fn(JSON.stringify(active)));
+            fn.destroy();
+            indeg = {}; pathId = {};
+            G.nodes.forEach(n => { indeg[n.id] = 0; if (n.path) pathId[n.path] = n.id; });
+            G.edges.forEach(e => indeg[e.to]++);
+            G.nodes.forEach(n => n.value = 1 + indeg[n.id]);  // node size ~ how often it is referred
+            currentGraphData = G;
+            if (regroup) renderGroups();
+            else document.querySelectorAll('#groups li').forEach(li => li.querySelector('.badge').textContent = '\u21A9 ' + (indeg[pathId[li.dataset.filename]] || 0));
+            $('restoreBtn').style.display = removed.size ? '' : 'none';
+            $('restoreBtn').textContent = `Restore removed (${removed.size})`;
+            renderGraph($('themeSelect').value);
+        }
 
-        document.getElementById('generateBtn').addEventListener('click', async () => {
-            const btn = document.getElementById('generateBtn');
+        $('groups').addEventListener('click', e => {
+            const b = e.target.closest('.x');
+            if (!b) return;
+            if (b.classList.contains('grp-del')) {
+                const g = b.closest('.group');
+                if (!confirm('Remove this group and all its notes from the export?')) return;
+                g.querySelectorAll('li').forEach(li => removed.add(li.dataset.filename));
+                g.remove();
+            } else {
+                const li = b.closest('li');
+                removed.add(li.dataset.filename);
+                li.remove();
+            }
+            refreshGraph(false);
+        });
+        $('restoreBtn').addEventListener('click', () => { removed.clear(); refreshGraph(true); });
+        $('addGroupBtn').addEventListener('click', () => {
+            const g = makeGroup('New group', [], null);
+            $('groups').prepend(g);
+            g.querySelector('.grp-name').focus();
+        });
+        ['groupBy', 'orderBy', 'ascending'].forEach(id => $(id).addEventListener('change', () => { if (G.files.length) renderGroups(); }));
+
+        // ---- Import (keeps folder structure) ----
+        async function handleFileImport(files) {
+            vaultFiles = {}; vaultAssets = {}; vaultPdfs = {}; pdfPages = {}; removed.clear();
+            for (const f of files) {
+                const parts = (f.webkitRelativePath || f.name).replace(/\\/g, '/').split('/');
+                if (f.webkitRelativePath) parts.shift();  // drop the vault root folder name
+                if (parts.some(s => s.startsWith('.'))) continue;  // .obsidian, .trash, dotfiles
+                const path = parts.join('/'), ext = path.substring(path.lastIndexOf('.')).toLowerCase();
+                if (ext === '.md') vaultFiles[path] = await f.text();
+                else if (ext === '.pdf') vaultPdfs[path] = await f.arrayBuffer();
+                else if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'].includes(ext)) {
+                    vaultAssets[path] = await new Promise(res => { const r = new FileReader(); r.onload = e => res(e.target.result); r.readAsDataURL(f); });
+                }
+            }
+            const load = pyodide.globals.get('load_vault');
+            load(JSON.stringify(vaultFiles), JSON.stringify([...Object.keys(vaultAssets), ...Object.keys(vaultPdfs)]));
+            load.destroy();
+            $('generateBtn').style.display = 'block';
+            refreshGraph(true);
+        }
+        $('folderInput').addEventListener('change', e => handleFileImport(e.target.files));
+        $('fileInput').addEventListener('change', e => handleFileImport(e.target.files));
+
+        // ---- Embedded PDFs / assets ----
+        async function ensurePdfPages() {
+            if (!window.pdfjsLib) return;
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            const corpus = Object.values(vaultFiles).join('\n').toLowerCase();
+            for (const p of Object.keys(vaultPdfs)) {
+                if (pdfPages[p] || !corpus.includes(p.split('/').pop().toLowerCase())) continue;  // only render PDFs that are embedded
+                $('status-box').textContent = 'Rasterising ' + p;
+                const doc = await pdfjsLib.getDocument({ data: vaultPdfs[p].slice(0) }).promise;
+                pdfPages[p] = [];
+                for (let i = 1; i <= doc.numPages; i++) {
+                    const pg = await doc.getPage(i), vp = pg.getViewport({ scale: 1.5 });
+                    const cv = document.createElement('canvas');
+                    cv.width = vp.width; cv.height = vp.height;
+                    await pg.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+                    pdfPages[p].push(cv.toDataURL('image/jpeg', 0.85));
+                }
+            }
+        }
+        async function hydrate(root) {
+            root.querySelectorAll('img[data-asset]').forEach(i => { i.src = vaultAssets[i.dataset.asset] || ''; });
+            root.querySelectorAll('.pdf-embed').forEach(d => {
+                const pgs = pdfPages[d.dataset.pdf] || [], only = +d.dataset.page;
+                const sel = only ? pgs.slice(only - 1, only) : pgs;
+                d.innerHTML = sel.length ? sel.map(u => `<img src="${u}">`).join('') : '<em>[PDF could not be rendered]</em>';
+            });
+            await Promise.all([...root.querySelectorAll('img')].map(i => i.decode ? i.decode().catch(() => {}) : 0));
+        }
+
+        // Helper function to extract DOM word elements and pixel coordinates for PDF invisible text layer
+        function extractTextItems(element, pageRect) {
+            const textItems = [];
+            const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+
+            while ((node = walker.nextNode())) {
+                const text = node.nodeValue;
+                if (!text || !text.trim()) continue;
+
+                const parent = node.parentElement;
+                if (!parent) continue;
+
+                const parentStyle = window.getComputedStyle(parent);
+                if (parentStyle.display === 'none' || parentStyle.visibility === 'hidden') continue;
+
+                const fontSizePx = parseFloat(parentStyle.fontSize) || 13.5;
+
+                // Word-level range bounding box extraction
+                const regex = /\S+/g;
+                let match;
+
+                while ((match = regex.exec(text)) !== null) {
+                    const word = match[0];
+                    const startIdx = match.index;
+                    const endIdx = startIdx + word.length;
+
+                    const range = document.createRange();
+                    try {
+                        range.setStart(node, startIdx);
+                        range.setEnd(node, endIdx);
+                        const rects = range.getClientRects();
+
+                        for (let i = 0; i < rects.length; i++) {
+                            const r = rects[i];
+                            if (r.width === 0 || r.height === 0) continue;
+
+                            textItems.push({
+                                word: word,
+                                relX: r.left - pageRect.left,
+                                relY: r.top - pageRect.top,
+                                fontSizePx: fontSizePx,
+                                heightPx: r.height
+                            });
+                        }
+                    } catch (e) {
+                        // Ignore boundary errors if any
+                    }
+                }
+            }
+            return textItems;
+        }
+
+        $('generateBtn').addEventListener('click', async () => {
+            const btn = $('generateBtn'), setStatus = t => { $('status-box').textContent = t; };
+            const resetBtn = () => { btn.textContent = 'Generate PDF Document'; btn.disabled = false; };
+            const groupsDom = [...document.querySelectorAll('#groups .group')].map(g => ({
+                name: g.querySelector('.grp-name').textContent.trim() || 'Untitled',
+                files: [...g.querySelectorAll('li')].map(li => li.dataset.filename)
+            })).filter(g => g.files.length);
+            const orderedFiles = groupsDom.flatMap(g => g.files);
+            if (!orderedFiles.length) { alert('No notes left to export.'); return; }
             btn.textContent = 'Generating PDF...';
             btn.disabled = true;
 
-            const selectedTheme = document.getElementById('themeSelect').value;
+            const selectedTheme = $('themeSelect').value;
             const scheme = OBSIDIAN_SCHEMES[selectedTheme];
+            const compact = $('compact').checked;
 
             // Capture Graph Canvas
             network.fit();
@@ -414,26 +672,16 @@ def render_note_to_html(filename, content, files_json, assets_json, title_to_id_
             ctx.drawImage(graphCanvas, 0, 0);
             const graphImgBase64 = tempCanvas.toDataURL('image/png');
 
-            const items = document.querySelectorAll('#sortable-list li');
-            const orderedFiles = Array.from(items).map(item => item.dataset.filename);
-
             const jsPDFClass = window.jspdf ? window.jspdf.jsPDF : window.jsPDF;
             if (!jsPDFClass) {
                 alert("Error: PDF engine failed to load. Please refresh the page.");
-                btn.textContent = 'Generate PDF Document';
-                btn.disabled = false;
+                resetBtn();
                 return;
             }
-
             const pdf = new jsPDFClass({ unit: 'pt', format: 'a4', orientation: 'portrait' });
-            const stage = document.getElementById('pdf-render-stage');
-
-            const titleToId = {};
-            orderedFiles.forEach((fname, idx) => {
-                const title = fname.replace(/\.md\$/i, '');
-                titleToId[title] = `note-${idx + 1}`;
-            });
-
+            const stage = $('pdf-render-stage');
+            const PW = pdf.internal.pageSize.getWidth(), PH = pdf.internal.pageSize.getHeight();
+            await ensurePdfPages();
             const pdfStyleHeader = `
                 <style>
                     .pdf-page {
@@ -558,71 +806,77 @@ def render_note_to_html(filename, content, files_json, assets_json, title_to_id_
                     img { max-width: 100%; height: auto; display: block; margin: 14px auto; border-radius: 6px; }
                     ul, ol { padding-left: 22px; margin: 10px 0; }
                     li { margin-bottom: 4px; }
+                    mark { background: rgba(255, 208, 0, 0.35); color: ${scheme.title}; padding: 0 2px; border-radius: 3px; }
+                    strong { font-weight: 700; color: ${scheme.title}; }
+                    em { font-style: italic; }
+                    del { opacity: 0.65; }
+                    hr { border: 0; border-top: 1px solid ${scheme.border}; margin: 16px 0; }
+                    li.task { list-style: none; margin-left: -18px; }
+                    .cb { display: inline-block; width: 11px; height: 11px; line-height: 11px; border: 1.5px solid ${scheme.accent}; border-radius: 3px; margin-right: 7px; font-size: 9px; text-align: center; vertical-align: -1px; color: #fff; }
+                    .cb.on { background: ${scheme.accent}; }
+                    .callout { border-left: 4px solid #3b82f6; background: rgba(59,130,246,0.13); border-radius: 4px; padding: 8px 14px; margin: 14px 0; }
+                    .callout.ok { border-color: #22c55e; background: rgba(34,197,94,0.13); }
+                    .callout.warn { border-color: #f59e0b; background: rgba(245,158,11,0.13); }
+                    .callout.bad { border-color: #ef4444; background: rgba(239,68,68,0.13); }
+                    .callout.mute { border-color: #9ca3af; background: rgba(156,163,175,0.13); }
+                    .callout-title { font-weight: 600; color: ${scheme.title}; margin-bottom: 4px; }
+                    .callout p:last-child { margin-bottom: 0; }
+                    .embed { border-left: 3px solid ${scheme.accent}; background: ${scheme.quote_bg}; padding: 6px 14px; margin: 14px 0; border-radius: 0 4px 4px 0; }
+                    .embed-title { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: ${scheme.nodeUnresolved}; margin-bottom: 6px; }
+                    .pdf-embed img { border: 1px solid ${scheme.border}; margin: 8px auto; }
+                    .group-banner { font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase; color: ${scheme.accent}; margin-bottom: 8px; }
+                    ${compact ? `
+                    .pdf-page { padding: 12px 40px 8px; font-size: 12.5px; line-height: 1.4; }
+                    .pdf-page h1 { font-size: 19px; margin: 0 0 8px; padding-bottom: 4px; }
+                    h2 { margin: 12px 0 6px; } h3 { margin: 10px 0 5px; } p { margin: 0 0 6px; }
+                    ul, ol { margin: 4px 0; padding-left: 20px; } li { margin-bottom: 1px; }
+                    pre, blockquote, .callout, .embed, table, hr { margin: 8px 0; } img { margin: 8px auto; }
+                    .group-banner { margin-bottom: 4px; }` : ''}
                 </style>
             `;
 
-            // PASS 1: Pre-render DOM offscreen to compute page heights and target link mappings
-            const noteRenderData = [];
-            const noteIdToPdfPageMap = {};
-            let currentPdfPage = 2; // Page 1 reserved for Vault Graph View
-
-            const renderNoteFunc = pyodide.globals.get('render_note_to_html');
-
-            for (let idx = 0; idx < orderedFiles.length; idx++) {
-                const filename = orderedFiles[idx];
-                const title = filename.replace(/\.md\$/i, '');
-                const noteId = `note-${idx + 1}`;
-                const rawContent = vaultFiles[filename] || '';
-
-                const noteDataRaw = renderNoteFunc(
-                    filename, rawContent, JSON.stringify(vaultFiles), JSON.stringify(vaultAssets), JSON.stringify(titleToId)
-                );
-                const noteData = JSON.parse(noteDataRaw);
-
-                let tableClass = "";
-                if (noteData.cols >= 10) tableClass = "ultra-wide-table";
-                else if (noteData.cols >= 6) tableClass = "wide-table";
-
-                stage.innerHTML = `
-                    ${pdfStyleHeader}
-                    <div class="pdf-page ${tableClass}">
-                        <h1>${title}</h1>
-                        <div>${noteData.html}</div>
-                    </div>
-                `;
-
-                const element = stage.querySelector('.pdf-page');
-                const canvas = await html2canvas(element, { scale: 2, backgroundColor: scheme.bg, width: 794, logging: false });
-
-                const pdfWidth = pdf.internal.pageSize.getWidth();
-                const pdfHeight = pdf.internal.pageSize.getHeight();
-                const pageCanvasHeight = Math.floor((pdfHeight / pdfWidth) * canvas.width);
-                const totalPages = Math.max(1, Math.ceil(canvas.height / pageCanvasHeight));
-
-                const pageRect = element.getBoundingClientRect();
-                const pxToPt = pdfWidth / pageRect.width;
-                const links = Array.from(element.querySelectorAll('a')).map(a => ({
-                    rect: a.getBoundingClientRect(),
-                    href: a.getAttribute('href')
-                }));
-
-                noteIdToPdfPageMap[noteId] = currentPdfPage;
-
-                noteRenderData.push({
-                    canvas,
-                    pageCanvasHeight,
-                    totalPages,
-                    pageRect,
-                    pxToPt,
-                    links
-                });
-
-                currentPdfPage += totalPages;
+            // PASS 1: render every note offscreen (embeds resolved in place), keep text/link geometry
+            const p2id = {};
+            orderedFiles.forEach((p, i) => p2id[p] = `note-${i + 1}`);
+            const items = [], renderFn = pyodide.globals.get('render_note');
+            let count = 0;
+            for (let gi = 0; gi < groupsDom.length; gi++) {
+                const g = groupsDom[gi];
+                for (let k = 0; k < g.files.length; k++) {
+                    const path = g.files[k], title = baseName(path);
+                    setStatus(`Rendering ${++count}/${orderedFiles.length}: ${title}`);
+                    const data = JSON.parse(renderFn(path, compact, JSON.stringify(p2id)));
+                    const tableClass = data.cols >= 10 ? 'ultra-wide-table' : data.cols >= 6 ? 'wide-table' : '';
+                    const banner = k === 0 ? `<div class="group-banner">${esc(g.name)}</div>` : '';
+                    stage.innerHTML = `${pdfStyleHeader}<div class="pdf-page ${tableClass}">${banner}<h1>${esc(title)}</h1><div>${data.html}</div></div>`;
+                    const element = stage.querySelector('.pdf-page');
+                    await hydrate(element);
+                    const canvas = await html2canvas(element, { scale: 2, backgroundColor: scheme.bg, width: 794, logging: false });
+                    const pageRect = element.getBoundingClientRect();
+                    items.push({
+                        gi, title, noteId: p2id[path], canvas, pageRect, hPx: canvas.height / 2,
+                        links: [...element.querySelectorAll('a')].map(a => ({ rect: a.getBoundingClientRect(), href: a.getAttribute('href') })),
+                        textItems: extractTextItems(element, pageRect)
+                    });
+                }
             }
+            renderFn.destroy();
 
-            renderNoteFunc.destroy();
-
-            // PASS 2: Construct PDF document with 1:1 aspect ratio preserved
+            // LAYOUT: normal = each note starts a new page; compact = notes flow continuously
+            const PAGE_H = Math.floor(794 * PH / PW), pages = [[]], notePage = {};
+            let y = 0;
+            const newPage = () => { pages.push([]); y = 0; };
+            items.forEach(it => {
+                if (y > 0 && (!compact || PAGE_H - y < 90)) newPage(); else if (y > 0) y += 12;
+                notePage[it.noteId] = pages.length + 1;  // +1: page 1 is the graph
+                for (let src = 0; src < it.hPx - 0.5;) {
+                    if (y >= PAGE_H - 1) newPage();
+                    const h = Math.min(PAGE_H - y, it.hPx - src);
+                    pages[pages.length - 1].push({ it, src, h, y });
+                    src += h; y += h;
+                }
+            });
+            // PASS 2: Construct PDF document with invisible text overlay & interactive link rects
             const pdfWidth = pdf.internal.pageSize.getWidth();
             const pdfHeight = pdf.internal.pageSize.getHeight();
 
@@ -642,70 +896,58 @@ def render_note_to_html(filename, content, files_json, assets_json, title_to_id_
             const graphCanvasEl = await html2canvas(stage.querySelector('.pdf-page-graph'), { scale: 2, backgroundColor: scheme.bg, width: 794, logging: false });
             pdf.addImage(graphCanvasEl.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pdfWidth, pdfHeight);
 
-            // Note Pages
-            for (let idx = 0; idx < noteRenderData.length; idx++) {
-                const item = noteRenderData[idx];
+            // Add invisible text title to Page 1
+            pdf.setFont("helvetica", "normal");
+            pdf.setFontSize(16.5);
+            pdf.text("Vault Graph View", 30, 45, { renderingMode: 'invisible' });
 
-                for (let pageIdx = 0; pageIdx < item.totalPages; pageIdx++) {
-                    pdf.addPage();
-                    pdf.setFillColor(scheme.bg);
-                    pdf.rect(0, 0, pdfWidth, pdfHeight, 'F');
+            // PASS 2: draw pages, invisible text layer and link hotspots
+            setStatus('Assembling PDF...');
+            pages.forEach(slices => {
+                pdf.addPage();
+                const cv = document.createElement('canvas');
+                cv.width = 794 * 2; cv.height = PAGE_H * 2;
+                const c2 = cv.getContext('2d');
+                c2.fillStyle = scheme.bg; c2.fillRect(0, 0, cv.width, cv.height);
+                slices.forEach(s => c2.drawImage(s.it.canvas, 0, s.src * 2, s.it.canvas.width, s.h * 2, 0, s.y * 2, cv.width, s.h * 2));
+                pdf.setFillColor(scheme.bg);
+                pdf.rect(0, 0, pdfWidth, pdfHeight, 'F');
+                pdf.addImage(cv.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pdfWidth, pdfHeight);
 
-                    const subCanvas = document.createElement('canvas');
-                    subCanvas.width = item.canvas.width;
-                    subCanvas.height = item.pageCanvasHeight;
-                    const subCtx = subCanvas.getContext('2d');
-
-                    subCtx.fillStyle = scheme.bg;
-                    subCtx.fillRect(0, 0, subCanvas.width, subCanvas.height);
-
-                    const sourceY = pageIdx * item.pageCanvasHeight;
-                    const sourceH = Math.min(item.pageCanvasHeight, item.canvas.height - sourceY);
-
-                    subCtx.drawImage(
-                        item.canvas,
-                        0, sourceY, item.canvas.width, sourceH,
-                        0, 0, item.canvas.width, sourceH
-                    );
-
-                    pdf.addImage(subCanvas.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pdfWidth, pdfHeight);
-
-                    // Attach Link rects
-                    const pageSourceYStartPx = (pageIdx * item.pageCanvasHeight) / 2;
-                    const pageSourceYEndPx = pageSourceYStartPx + (item.pageCanvasHeight / 2);
-
-                    item.links.forEach(linkObj => {
-                        const relYPx = linkObj.rect.top - item.pageRect.top;
-
-                        if (relYPx >= pageSourceYStartPx && relYPx < pageSourceYEndPx) {
-                            const relXPx = linkObj.rect.left - item.pageRect.left;
-                            const linkX = relXPx * item.pxToPt;
-                            const linkY = (relYPx - pageSourceYStartPx) * item.pxToPt;
-                            const linkW = linkObj.rect.width * item.pxToPt;
-                            const linkH = linkObj.rect.height * item.pxToPt;
-
-                            const href = linkObj.href;
-                            if (href) {
-                                if (href.startsWith('#note-')) {
-                                    const targetNoteId = href.substring(1);
-                                    const targetPageNum = noteIdToPdfPageMap[targetNoteId];
-                                    if (targetPageNum) {
-                                        pdf.link(linkX, linkY, linkW, linkH, { pageNumber: targetPageNum });
-                                    }
-                                } else if (href.startsWith('http://') || href.startsWith('https://')) {
-                                    pdf.link(linkX, linkY, linkW, linkH, { url: href });
-                                }
-                            }
+                slices.forEach(({ it, src, h, y }) => {
+                    const k = pdfWidth / it.pageRect.width, dy = y - src;
+                    pdf.setFont("helvetica", "normal");
+                    it.textItems.forEach(t => {
+                        if (t.relY >= src && t.relY < src + h) {
+                            pdf.setFontSize(t.fontSizePx * k);
+                            pdf.text(t.word, t.relX * k, (t.relY + dy + t.heightPx * 0.82) * k, { renderingMode: 'invisible' });
                         }
                     });
-                }
-            }
+                    it.links.forEach(l => {
+                        const ry = l.rect.top - it.pageRect.top;
+                        if (!l.href || ry < src || ry >= src + h) return;
+                        const a = [(l.rect.left - it.pageRect.left) * k, (ry + dy) * k, l.rect.width * k, l.rect.height * k];
+                        if (l.href.startsWith('#note-')) {
+                            const pn = notePage[l.href.slice(1)];
+                            if (pn) pdf.link(...a, { pageNumber: pn });
+                        } else if (/^https?:/.test(l.href)) pdf.link(...a, { url: l.href });
+                    });
+                });
+            });
+
+            // Bookmarks: group > note
+            try {
+                const gn = {};
+                items.forEach(it => {
+                    gn[it.gi] ??= pdf.outline.add(null, groupsDom[it.gi].name, { pageNumber: notePage[it.noteId] });
+                    pdf.outline.add(gn[it.gi], it.title, { pageNumber: notePage[it.noteId] });
+                });
+            } catch (e) { console.warn('Outline skipped', e); }
 
             stage.innerHTML = '';
             pdf.save('obsidian-stitched.pdf');
-
-            btn.textContent = 'Generate PDF Document';
-            btn.disabled = false;
+            setStatus('WASM Ready');
+            resetBtn();
         });
     </script>
 </body>
